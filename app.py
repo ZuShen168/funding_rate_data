@@ -2,20 +2,23 @@
 
     streamlit run app.py
 
-Two tabs, two questions:
+Three tabs:
   Spread analysis  - does the spread clear break-even, and for how long?
-  Position & risk  - if I put capital behind it, what would I earn, and where
-                     do I get liquidated?
+  Position & risk  - what would it earn, and where do you get liquidated?
+  Screener         - every combination ranked, so you don't click through them.
 
 The long leg can be another venue's perp, OR spot with a manually entered APY.
 The second mode is cash-and-carry: hold the asset, short the perp, collect
-funding. Different capital maths and only one liquidatable leg - see below.
+funding. Different capital maths, one liquidatable leg instead of two, and a
+different right answer for the yield basis - see the Mean/Median note below.
 
 Everything user-facing is in % APR. Fees stay in bps in the sidebar because
 that's how exchanges quote them, and get converted internally.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -27,13 +30,14 @@ from src.store import load
 st.set_page_config(page_title="Funding spread explorer", layout="wide")
 
 SPOT = "— spot / custom APY —"
+DATA_DIR = Path("data/funding")
 
 
 def _data_fingerprint() -> tuple:
-    """Newest mtime + total size across the parquet files."""
-    from pathlib import Path
-    files = sorted(Path("data/funding").rglob("*.parquet"))
-    return tuple((f.stat().st_mtime, f.stat().st_size) for f in files)
+    """mtime + size of every parquet file, so a new backfill busts the cache."""
+    return tuple(
+        (f.stat().st_mtime, f.stat().st_size) for f in sorted(DATA_DIR.rglob("*.parquet"))
+    )
 
 
 @st.cache_data
@@ -51,7 +55,11 @@ def _daily_apr(fingerprint: tuple) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def spot_price(canonical: str) -> float | None:
-    """Current mark price from Binance futures. Cached 5 min."""
+    """Current mark price from Binance futures. Cached 5 min.
+
+    Only anchors the liquidation display - the funding analysis doesn't depend
+    on it, and equity perps won't resolve here at all.
+    """
     base, quote, _ = canonical.split("-")
     for sym in (f"{base}{quote}", f"{base}USDT"):
         try:
@@ -67,6 +75,7 @@ def spot_price(canonical: str) -> float | None:
 
 
 def run_lengths(mask: pd.Series) -> pd.Series:
+    """Lengths of each consecutive True stretch."""
     groups = (mask != mask.shift()).cumsum()
     return mask.groupby(groups).sum().loc[lambda s: s > 0]
 
@@ -93,13 +102,14 @@ with st.sidebar:
     )
 
     spot_mode = vb == SPOT
+    custom_apy = 0.0
     if spot_mode:
         custom_apy = st.number_input(
             "Long leg APY (%)", -50.0, 100.0, 0.0, 0.5,
             help="0 for plain spot sitting in a wallet. Positive if the asset "
                  "earns yield (staked ETH, a yield-bearing stable, lending it "
-                 "out). Negative if you're borrowing to fund the purchase - "
-                 "enter the borrow rate as a negative number.",
+                 "out). Negative for the cost of holding it - borrow rate, or "
+                 "the drag on a tokenised equity vs owning the share.",
         )
 
     st.header("Your costs")
@@ -118,10 +128,23 @@ with st.sidebar:
              "altcoin perps than on BTC.",
     )
     hold_days = st.slider(
-        "Assumed hold (days)", 1, 60, 14,
+        "Assumed hold (days)", 1, 90, 14,
         help="How long you expect to keep the position open. This spreads the "
              "fixed cost out: hold twice as long and the cost per day halves, "
-             "so the break-even line drops.",
+             "so the break-even line drops. Don't set it longer than the "
+             "'longest stretch' figure unless you're in spot mode - otherwise "
+             "you're amortising over a hold you could never achieve.",
+    )
+
+    yield_basis = st.radio(
+        "Yield basis", ["Mean", "Median"],
+        index=0 if spot_mode else 1, horizontal=True,
+        help="MEAN: right when you hold through quiet periods and collect "
+             "whatever comes - cash-and-carry. Zero-funding days cost you "
+             "nothing, so the occasional spike still counts.\n\n"
+             "MEDIAN: right when you only enter while the spread is wide and "
+             "exit when it isn't - the cross-venue spread trade, where a "
+             "collapsed spread means you're actively paying.",
     )
 
     st.header("Position")
@@ -153,7 +176,6 @@ if va not in wide:
     st.stop()
 
 if spot_mode:
-    # Constant APY across the whole history - it's an assumption, not data.
     long_label = "spot"
     long_series = pd.Series(custom_apy, index=wide.index)
     spread = (wide[va] - long_series).dropna()
@@ -178,7 +200,7 @@ runs = run_lengths(above)
 #
 #   spot      : you pay full price N for the asset, plus N/L margin for the
 #               short. C = N(1 + 1/L), so N = C*L/(L+1) and the multiplier is
-#               L/(L+1) - which approaches 1 but never exceeds it.
+#               L/(L+1) - approaches 1 but never exceeds it.
 if spot_mode:
     multiplier = leverage / (leverage + 1.0)
     notional_per_leg = capital * multiplier
@@ -186,18 +208,33 @@ else:
     multiplier = leverage / 2.0
     notional_per_leg = (capital / 2.0) * leverage
 
-median_spread = spread.median()
-gross_yield = median_spread * multiplier
-net_yield = (median_spread - breakeven) * multiplier
+# The yield basis matters enormously on skewed distributions. A perp that pays
+# zero 75% of the time and spikes occasionally has a median of 0 and a healthy
+# mean - and for a position you simply hold, the mean is what you collect.
+basis_spread = spread.mean() if yield_basis == "Mean" else spread.median()
+skewed = abs(spread.mean() - spread.median()) > max(1.0, 0.5 * abs(spread.median()))
+
+gross_yield = basis_spread * multiplier
+net_yield = (basis_spread - breakeven) * multiplier
 
 # --- headline numbers (shared across tabs) ---------------------------------
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Break-even", f"{breakeven:.1f}% APR",
           help=f"{cost_pct:.2f}% of notional, amortised over a {hold_days}-day hold")
-c2.metric("Median spread", f"{median_spread:.1f}% APR")
+c2.metric(f"{yield_basis} spread", f"{basis_spread:.1f}% APR",
+          help=f"mean {spread.mean():.1f}%  /  median {spread.median():.1f}%")
 c3.metric("Days above line", f"{100 * above.mean():.1f}%")
 c4.metric("Longest stretch", f"{int(runs.max())}d" if len(runs) else "0d",
           help=f"You need {hold_days}d to break even")
+
+if skewed:
+    st.info(
+        f"**Skewed distribution.** Mean {spread.mean():.1f}% vs median "
+        f"{spread.median():.1f}% APR - this pair pays nothing much of the time "
+        f"and spikes occasionally. Which one is right depends on the trade: "
+        f"if you hold through the quiet periods (cash-and-carry), use the mean. "
+        f"If you only enter when the spread is wide, use the median."
+    )
 
 tab_spread, tab_position, tab_screener = st.tabs(
     ["Spread analysis", "Position & risk", "Screener"]
@@ -225,6 +262,9 @@ with tab_spread:
         annotation_position="top left",
     )
     fig.add_hline(y=-breakeven, line=dict(color="#e45756", width=2, dash="dash"))
+    fig.add_hline(y=spread.mean(), line=dict(color="#54a24b", width=1.5, dash="dot"),
+                  annotation_text=f"mean {spread.mean():.1f}%",
+                  annotation_position="bottom left")
 
     for _, grp in above.groupby((above != above.shift()).cumsum()):
         if grp.iloc[0]:
@@ -243,14 +283,16 @@ with tab_spread:
         st.caption(
             f"Cash-and-carry: hold {symbol.split('-')[0]} spot, short the perp "
             f"on {va}. Positive means the funding you receive beats the "
-            f"{custom_apy:.1f}% your spot earns. No second venue's funding to "
-            f"chase - you just need the short leg's funding to stay positive."
+            f"{custom_apy:.1f}% your spot earns. Note that in this mode a "
+            f"collapsed spread costs you nothing - you simply earn nothing that "
+            f"day - so the green bands matter less than the mean line."
         )
     else:
         st.caption(
             "Positive means shorting A and going long B earns funding. Green "
             "bands are stretches clearing break-even. A band narrower than your "
-            "hold period is not a trade."
+            "hold period is not a trade - you'd pay the round trip and exit "
+            "before funding covered it."
         )
 
     st.subheader("Funding rate by leg")
@@ -309,14 +351,16 @@ with tab_spread:
         st.plotly_chart(bar, use_container_width=True)
         st.caption(
             f"Bars to the LEFT of the red line are too short to trade. "
-            f"Longest stretch was {int(runs.max())} days against {hold_days} needed."
+            f"Longest stretch was {int(runs.max())} days against {hold_days} "
+            f"needed. In spot mode this matters much less - you can sit through "
+            f"the gaps."
         )
     else:
         st.info("The spread never clears break-even at this hold period. "
                 "Try a longer hold, or lower your cost assumptions.")
 
 # ===========================================================================
-# TAB 2 - what it would earn, and what it would cost you if it went wrong
+# TAB 2 - what it would earn, and what it would cost if it went wrong
 # ===========================================================================
 with tab_position:
     st.subheader("If you traded this")
@@ -332,30 +376,42 @@ with tab_position:
     y1, y2, y3, y4 = st.columns(4)
     y1.metric("Notional per leg", f"${notional_per_leg:,.0f}")
     y2.metric("Gross yield on capital", f"{gross_yield:.1f}% APR",
-              help=f"Median spread x {multiplier:.2f} "
+              help=f"{yield_basis} spread x {multiplier:.2f} "
                    + ("(L/(L+1) - spot is unlevered)" if spot_mode
                       else "(leverage/2 - capital splits across two venues)"))
     y3.metric("Net yield on capital", f"{net_yield:.1f}% APR",
               delta=f"${capital * net_yield / 100:,.0f}/yr", delta_color="normal",
               help="After fees and slippage, at the assumed hold period")
     y4.metric("Days the trade exists", f"{100 * above.mean():.0f}% of days",
-              help="Share of days the spread cleared break-even. The yield "
-                   "assumes you're in the trade - you can't be, most of the time.")
+              help="Share of days the spread cleared break-even.")
 
     if net_yield <= 0:
         st.error(
-            f"**Negative at these assumptions.** The median spread "
-            f"({median_spread:.1f}%) doesn't cover the {breakeven:.1f}% "
+            f"**Negative at these assumptions.** The {yield_basis.lower()} "
+            f"spread ({basis_spread:.1f}%) doesn't cover the {breakeven:.1f}% "
             f"break-even. Leverage scales gross and costs equally, so it can't "
             f"fix this - it only makes the loss bigger."
+            + (f" Note the mean is {spread.mean():.1f}% - if you intend to hold "
+               f"through quiet periods rather than trade in and out, switch the "
+               f"yield basis." if yield_basis == "Median" and skewed else "")
+        )
+    elif spot_mode:
+        st.warning(
+            f"**Assumes you hold continuously for the full year.** Funding is "
+            f"collected whenever it's positive and you earn nothing when it "
+            f"isn't - you don't lose, but you don't earn either. The round trip "
+            f"is paid once, so a longer hold genuinely does improve this. Check "
+            f"the history span before extrapolating: a few months of data is "
+            f"a regime, not a constant."
         )
     else:
         st.warning(
-            f"**Upper bound, not an expectation.** It assumes you hold "
-            f"continuously at the median spread. The spread only cleared "
-            f"break-even on {100 * above.mean():.0f}% of days, and the longest "
-            f"unbroken stretch was {int(runs.max()) if len(runs) else 0} days "
-            f"against the {hold_days} you need."
+            f"**Upper bound, not an expectation.** It assumes you're in the "
+            f"trade continuously at the {yield_basis.lower()} spread. It only "
+            f"cleared break-even on {100 * above.mean():.0f}% of days, and the "
+            f"longest unbroken stretch was "
+            f"{int(runs.max()) if len(runs) else 0} days against the "
+            f"{hold_days} you need."
         )
 
     if spot_mode:
@@ -363,7 +419,9 @@ with tab_position:
             "In spot mode the multiplier is leverage/(leverage+1), which "
             "approaches 1 but never exceeds it - you always pay full price for "
             "the spot leg. Lower ceiling than a levered perp/perp position, but "
-            "no second liquidation and no cross-venue margin problem."
+            "no second liquidation and no cross-venue margin problem. If the "
+            "spot leg is a tokenised asset, put its holding cost in the APY "
+            "field as a negative number."
         )
     else:
         st.caption(
@@ -382,9 +440,9 @@ with tab_position:
         st.error("Leverage is too high for that maintenance margin - "
                  "the position would be liquidated immediately.")
     elif price is None:
-        st.info(f"Couldn't fetch a current price. At {leverage:g}x with "
-                f"{mmr_pct:g}% maintenance margin, the short leg liquidates on "
-                f"a **{100 * adverse_move:.1f}%** upward move.")
+        st.info(f"Couldn't fetch a current price for {symbol}. At {leverage:g}x "
+                f"with {mmr_pct:g}% maintenance margin, the short leg "
+                f"liquidates on a **{100 * adverse_move:.1f}%** upward move.")
     else:
         l1, l2, l3 = st.columns(3)
         l1.metric("Current price", f"${price:,.2f}")
@@ -400,28 +458,26 @@ with tab_position:
                       f"${price * (1 - adverse_move):,.2f}",
                       delta=f"-{100 * adverse_move:.1f}%", delta_color="inverse")
 
-        if spot_mode:
-            st.warning(
-                f"**One liquidatable leg instead of two.** If price rises "
-                f"{100 * adverse_move:.1f}% the short on {va} is at risk, but "
-                f"your spot has gained the same amount and - unlike a perp on "
-                f"another venue - you can often post it as collateral on the "
-                f"same exchange, or sell part of it to top up margin. That is a "
-                f"materially better position than the cross-venue version, "
-                f"though it still isn't instant if the spot sits in "
-                f"self-custody."
-            )
-        else:
-            st.error(
-                f"**The hedge does not protect you here.** If price rises "
-                f"{100 * adverse_move:.1f}%, the short leg on {va} liquidates "
-                f"while the long leg on {vb} is sitting on an equal profit - "
-                f"but that profit is on a different exchange and cannot be used "
-                f"as margin. You would need to move collateral between venues "
-                f"before liquidation: a withdrawal, chain confirmation and "
-                f"deposit credit. Minutes at best, hours if a venue pauses "
-                f"withdrawals."
-            )
+    if spot_mode:
+        st.warning(
+            f"**One liquidatable leg instead of two.** If price rises "
+            f"{100 * adverse_move:.1f}% the short on {va} is at risk, but your "
+            f"spot has gained the same amount and - unlike a perp on another "
+            f"venue - you can often post it as collateral on the same exchange, "
+            f"or sell part of it to top up margin. Materially better than the "
+            f"cross-venue version, though not instant if the spot sits in "
+            f"self-custody."
+        )
+    else:
+        st.error(
+            f"**The hedge does not protect you here.** If price rises "
+            f"{100 * adverse_move:.1f}%, the short leg on {va} liquidates while "
+            f"the long leg on {long_label} is sitting on an equal profit - but "
+            f"that profit is on a different exchange and cannot be used as "
+            f"margin. You would need to move collateral between venues before "
+            f"liquidation: a withdrawal, chain confirmation and deposit credit. "
+            f"Minutes at best, hours if a venue pauses withdrawals."
+        )
 
     st.caption(
         "Simplified: assumes isolated margin, a flat maintenance margin rate, "
@@ -436,22 +492,26 @@ with tab_position:
 with tab_screener:
     st.subheader("Every combination, ranked")
     st.caption(
-        "Uses the cost and hold assumptions from the sidebar. Sorted by how "
-        "long profitable stretches LAST, not by how big the spread is - a huge "
-        "spread that survives two days is not a trade."
+        "Uses the cost, hold and yield-basis assumptions from the sidebar. "
+        "Sorted by net yield, but read 'max run' alongside it - for a "
+        "cross-venue spread trade a high yield with a short max run is a trap."
     )
 
-    include_spot = st.checkbox(
-        "Include spot as a long leg (cash-and-carry at 0% APY)", value=True,
-        help="Short the perp, hold spot. Only one liquidatable leg, and no "
-             "cross-venue margin problem.",
-    )
-    min_history = st.slider("Minimum history (days)", 30, 365, 180, 30,
-                            help="New listings dominate any ranking if you let "
-                                 "them. Filter them out.")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        include_spot = st.checkbox(
+            "Include spot as a long leg (cash-and-carry at 0% APY)", value=True,
+            help="Short the perp, hold spot. One liquidatable leg, no "
+                 "cross-venue margin problem.",
+        )
+    with sc2:
+        min_history = st.slider("Minimum history (days)", 30, 365, 90, 30,
+                                help="New listings dominate any ranking if you "
+                                     "let them. Equity perps are mostly recent, "
+                                     "so lower this to see them.")
 
     @st.cache_data
-    def screen(fingerprint: tuple, breakeven: float, hold: float,
+    def screen(fingerprint: tuple, be: float, mult: float, basis: str,
                with_spot: bool, min_days: int) -> pd.DataFrame:
         df = _daily_apr(fingerprint)
         rows = []
@@ -467,22 +527,22 @@ with tab_screener:
                 combos += [(a, "spot") for a in legs]
 
             for short_leg, long_leg in combos:
-                if long_leg == "spot":
-                    s = w[short_leg].dropna()
-                else:
-                    s = (w[short_leg] - w[long_leg]).dropna()
+                s = (w[short_leg] if long_leg == "spot"
+                     else w[short_leg] - w[long_leg]).dropna()
                 if len(s) < min_days:
                     continue
 
-                hot = s > breakeven
+                hot = s > be
                 r = run_lengths(hot)
+                bs = s.mean() if basis == "Mean" else s.median()
                 rows.append({
                     "symbol": sym,
                     "short": short_leg,
                     "long": long_leg,
-                    "median spread %": round(s.median(), 1),
+                    "net yield %": round((bs - be) * mult, 1),
+                    "mean %": round(s.mean(), 1),
+                    "median %": round(s.median(), 1),
                     "% days above": round(100 * hot.mean(), 1),
-                    "median run (d)": round(float(r.median()), 1) if len(r) else 0.0,
                     "max run (d)": int(r.max()) if len(r) else 0,
                     "windows": len(r),
                     "days": len(s),
@@ -491,55 +551,57 @@ with tab_screener:
         out = pd.DataFrame(rows)
         if out.empty:
             return out
-        return out.sort_values(
-            ["max run (d)", "median run (d)", "median spread %"], ascending=False
-        ).reset_index(drop=True)
+        return out.sort_values("net yield %", ascending=False).reset_index(drop=True)
 
-    table = screen(_data_fingerprint(), breakeven, hold_days,
-                   include_spot, min_history)
+    table = screen(_data_fingerprint(), breakeven, multiplier,
+                   yield_basis, include_spot, min_history)
 
     if table.empty:
         st.info("Nothing has enough history yet. Lower the minimum, or backfill more.")
     else:
-        tradeable = table[table["max run (d)"] >= hold_days]
+        positive = table[table["net yield %"] > 0]
 
         s1, s2, s3 = st.columns(3)
         s1.metric("Combinations tested", len(table))
-        s2.metric("Ever held long enough", len(tradeable),
-                  help=f"At least one stretch of {hold_days}+ days above break-even")
+        s2.metric("Positive net yield", len(positive))
         s3.metric("Break-even", f"{breakeven:.1f}% APR")
 
-        if tradeable.empty:
+        if positive.empty:
             st.error(
-                f"**Nothing clears the bar.** No combination held above "
-                f"{breakeven:.1f}% APR for {hold_days} consecutive days, even "
-                f"once, in the whole history. That is a real answer, not a bug - "
-                f"it means these spreads are noise rather than structure."
+                f"**Nothing clears the bar.** No combination has a "
+                f"{yield_basis.lower()} spread above the {breakeven:.1f}% APR "
+                f"break-even. That is a real answer, not a bug."
             )
         else:
             st.success(
-                f"**{len(tradeable)} combination(s)** held above break-even for "
-                f"{hold_days}+ days at least once. Those are the only rows worth "
-                f"opening in the other tabs."
+                f"**{len(positive)} combination(s)** show positive net yield at "
+                f"these assumptions. Open them in the other tabs before "
+                f"believing any of it - check the history span and whether the "
+                f"mean is being carried by a handful of spikes."
             )
 
         st.dataframe(
             table, use_container_width=True, height=520,
             column_config={
-                "max run (d)": st.column_config.ProgressColumn(
-                    "max run (d)", format="%d",
-                    min_value=0, max_value=int(table["max run (d)"].max() or 1),
-                ),
+                "net yield %": st.column_config.NumberColumn(format="%.1f%%"),
+                "mean %": st.column_config.NumberColumn(format="%.1f%%"),
+                "median %": st.column_config.NumberColumn(format="%.1f%%"),
                 "% days above": st.column_config.NumberColumn(format="%.1f%%"),
-                "median spread %": st.column_config.NumberColumn(format="%.1f%%"),
+                "max run (d)": st.column_config.ProgressColumn(
+                    "max run (d)", format="%d", min_value=0,
+                    max_value=int(table["max run (d)"].max() or 1),
+                ),
             },
         )
 
         st.caption(
-            "Read **max run** first. It answers: has this spread EVER survived "
-            "long enough to pay for its own round trip? If the answer is no, "
-            "nothing else in the row matters. A high '% days above' with a low "
-            "'max run' means the spread flickers across the line constantly "
-            "without ever staying there - the worst case, because it looks "
-            "promising on a screener and bleeds fees in practice."
+            "**mean vs median** is the tell. Where they diverge sharply, the "
+            "pair pays nothing most days and spikes occasionally - fine if you "
+            "hold through it, useless if you need to time entries. "
+            "**max run** answers whether the spread has EVER survived long "
+            "enough to pay for its own round trip. A high '% days above' with a "
+            "low 'max run' is the worst case: it flickers across the line "
+            "without staying there, looking promising while bleeding fees. "
+            "**days** is history length - treat anything under ~180 as a "
+            "regime, not a constant."
         )
