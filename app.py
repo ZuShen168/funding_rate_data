@@ -524,8 +524,15 @@ with tab_screener:
             )
 
         st.dataframe(
-            table.style.background_gradient(subset=["max run (d)"], cmap="Greens"),
-            use_container_width=True, height=520,
+            table, use_container_width=True, height=520,
+            column_config={
+                "max run (d)": st.column_config.ProgressColumn(
+                    "max run (d)", format="%d",
+                    min_value=0, max_value=int(table["max run (d)"].max() or 1),
+                ),
+                "% days above": st.column_config.NumberColumn(format="%.1f%%"),
+                "median spread %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
         )
 
         st.caption(
