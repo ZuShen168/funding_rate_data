@@ -1,0 +1,25 @@
+# --- SECRETS. Nothing below this line ever gets committed. ---
+.env
+.env.*
+*.key
+*.pem
+secrets.yaml
+config/credentials*
+**/api_keys*
+
+# --- Data. Large, regenerable, and may reveal what you're looking at. ---
+# Funding data IS committed — it's public info and the hosted app needs it.
+# Anything else under data/ stays out.
+data/*
+!data/funding/
+*.duckdb
+*.db
+.DS_Store
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/

@@ -1,0 +1,15 @@
+# Install once:  pip install pre-commit && pre-commit install
+# Do this BEFORE your first commit. A secret committed once lives in the
+# history forever, even after you delete the file.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=2000']
+      - id: detect-private-key
+      - id: end-of-file-fixer

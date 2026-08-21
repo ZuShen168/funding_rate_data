@@ -1,0 +1,81 @@
+# Hand-maintained. NOT scraped -- fee tiers change and you need the value that
+# applied AT THE TIME for a backtest to mean anything.
+#
+# Every entry is dated. When your fee tier changes, ADD an entry, do not edit
+# the old one.
+#
+# VERIFY EVERY NUMBER BELOW against the venue's current fee page before use.
+# These are placeholders to show the shape, not researched values. Replace the
+# fee figures with your own tier -- results are meaningless otherwise.
+
+venues:
+  binance:
+    contract_type: linear
+    quote: USDT
+    fees:
+      - effective_from: 2025-01-01
+        maker_bps: 2.0
+        taker_bps: 4.0
+        note: "PLACEHOLDER -- replace with your own fee tier"
+    funding_cap_per_interval: 0.0075   # varies by leverage bracket -- VERIFY
+    notes: >
+      Standard 8h cadence at 00/08/16 UTC. Shortens to 4h or 1h on volatile
+      pairs, which is why interval is derived from data rather than assumed.
+
+  bybit:
+    contract_type: linear
+    quote: USDT
+    fees:
+      - effective_from: 2025-01-01
+        maker_bps: 2.0
+        taker_bps: 5.5
+        note: "PLACEHOLDER -- replace with your own tier"
+    notes: >
+      Mostly 8h; some pairs 4h or 1h. USDC-settled perps use a *PERP suffix
+      (BTCPERP) rather than the quote currency in the symbol.
+
+  hyperliquid:
+    contract_type: linear
+    quote: USDC
+    fees:
+      - effective_from: 2025-01-01
+        maker_bps: 1.5
+        taker_bps: 4.5
+        note: "PLACEHOLDER -- volume-tiered, replace with your own"
+    funding_cap_per_interval: 0.04     # 4%/hour
+    interest_component_per_8h: 0.0001  # 0.01%/8h = 0.00125%/hr, ~11% APR to shorts
+    notes: >
+      Hourly settlement at 1/8 of the computed 8h rate. Premium uses IMPACT
+      bid/ask against a validator oracle (weighted median of CEX spot), so it
+      can diverge from a CEX for structural reasons, not just sentiment.
+      The interest floor means it sits at ~11% APR for long stretches.
+      Note that positions are public on-chain.
+
+  kraken:
+    contract_type: linear     # PF_* linear; PI_* are INVERSE -- tag separately
+    quote: USD
+    fees:
+      - effective_from: 2025-01-01
+        maker_bps: 1.5
+        taker_bps: 4.0
+        note: "PLACEHOLDER -- replace with your own tier"
+    notes: >
+      Accrues continuously as unrealised PnL, realised hourly -- a different
+      model from the discrete-settlement venues. Interval is region-dependent:
+      8h for US clients, hourly elsewhere. Confirm which applies to your
+      account before assuming the cadence.
+
+  lighter:
+    contract_type: linear
+    quote: USDC
+    fees:
+      - effective_from: 2025-01-01
+        maker_bps: 0.0
+        taker_bps: 0.0
+        note: >
+          Lighter has advertised zero/very low fees. If accurate this materially
+          changes the break-even maths -- VERIFY, and re-verify periodically,
+          since fee-free periods are usually incentive programmes.
+    notes: >
+      Hourly settlement, 1-hour premium divided by 8, plus a per-market fixed
+      interest component. Funding is peer-to-peer with no exchange cut.
