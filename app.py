@@ -60,8 +60,20 @@ with st.sidebar:
     st.header("Your costs")
     st.caption("Fees in bps, as exchanges quote them. Defaults are placeholders — "
                "replace with your own fee tier.")
-    round_trip_bps = st.number_input("Round-trip fees (bps)", 0.0, 100.0, 16.0, 1.0)
-    slippage_bps = st.number_input("Slippage, both legs (bps)", 0.0, 100.0, 6.0, 1.0)
+    round_trip_bps = st.number_input(
+        "Round-trip fees (bps)", 0.0, 100.0, 16.0, 1.0,
+        help="Exchange fees for the whole trade. A hedged position means four "
+             "fee events: open both legs, close both legs. At 4bps taker per "
+             "leg that's 16bps total. Check your own tier — it's usually lower "
+             "at size, and lower again if you can get filled as maker.",
+    )
+    slippage_bps = st.number_input(
+        "Slippage, both legs (bps)", 0.0, 100.0, 6.0, 1.0,
+        help="What you lose crossing the spread, over and above fees. You buy "
+             "slightly above mid and sell slightly below it, on both legs. "
+             "Grows with your position size and shrinks with book depth — so "
+             "it's much worse on thin altcoin perps than on BTC.",
+    )
     hold_days = st.slider("Assumed hold (days)", 1, 60, 14)
 
 if va == vb:
