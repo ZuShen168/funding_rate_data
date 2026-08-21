@@ -192,7 +192,9 @@ c3.metric("Days above line", f"{100 * above.mean():.1f}%")
 c4.metric("Longest stretch", f"{int(runs.max())}d" if len(runs) else "0d",
           help=f"You need {hold_days}d to break even")
 
-tab_spread, tab_position = st.tabs(["Spread analysis", "Position & risk"])
+tab_spread, tab_position, tab_screener = st.tabs(
+    ["Spread analysis", "Position & risk", "Screener"]
+)
 
 # ===========================================================================
 # TAB 1 - does the opportunity exist, and does it last?
@@ -420,3 +422,110 @@ with tab_position:
         "tiered maintenance margin that rises with position size. Check your "
         "exchange's own liquidation calculator before sizing anything."
     )
+
+# ===========================================================================
+# TAB 3 - rank every combination, so you don't click through them by hand
+# ===========================================================================
+with tab_screener:
+    st.subheader("Every combination, ranked")
+    st.caption(
+        "Uses the cost and hold assumptions from the sidebar. Sorted by how "
+        "long profitable stretches LAST, not by how big the spread is - a huge "
+        "spread that survives two days is not a trade."
+    )
+
+    include_spot = st.checkbox(
+        "Include spot as a long leg (cash-and-carry at 0% APY)", value=True,
+        help="Short the perp, hold spot. Only one liquidatable leg, and no "
+             "cross-venue margin problem.",
+    )
+    min_history = st.slider("Minimum history (days)", 30, 365, 180, 30,
+                            help="New listings dominate any ranking if you let "
+                                 "them. Filter them out.")
+
+    @st.cache_data
+    def screen(fingerprint: tuple, breakeven: float, hold: float,
+               with_spot: bool, min_days: int) -> pd.DataFrame:
+        df = _daily_apr(fingerprint)
+        rows = []
+
+        for sym, grp in df.groupby("canonical_symbol"):
+            w = grp.pivot_table(index="dt", columns="venue", values="apr_pct")
+            if len(w) < min_days:
+                continue
+
+            legs = list(w.columns)
+            combos = [(a, b) for a in legs for b in legs if a != b]
+            if with_spot:
+                combos += [(a, "spot") for a in legs]
+
+            for short_leg, long_leg in combos:
+                if long_leg == "spot":
+                    s = w[short_leg].dropna()
+                else:
+                    s = (w[short_leg] - w[long_leg]).dropna()
+                if len(s) < min_days:
+                    continue
+
+                hot = s > breakeven
+                r = run_lengths(hot)
+                rows.append({
+                    "symbol": sym,
+                    "short": short_leg,
+                    "long": long_leg,
+                    "median spread %": round(s.median(), 1),
+                    "% days above": round(100 * hot.mean(), 1),
+                    "median run (d)": round(float(r.median()), 1) if len(r) else 0.0,
+                    "max run (d)": int(r.max()) if len(r) else 0,
+                    "windows": len(r),
+                    "days": len(s),
+                })
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        return out.sort_values(
+            ["max run (d)", "median run (d)", "median spread %"], ascending=False
+        ).reset_index(drop=True)
+
+    table = screen(_data_fingerprint(), breakeven, hold_days,
+                   include_spot, min_history)
+
+    if table.empty:
+        st.info("Nothing has enough history yet. Lower the minimum, or backfill more.")
+    else:
+        tradeable = table[table["max run (d)"] >= hold_days]
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Combinations tested", len(table))
+        s2.metric("Ever held long enough", len(tradeable),
+                  help=f"At least one stretch of {hold_days}+ days above break-even")
+        s3.metric("Break-even", f"{breakeven:.1f}% APR")
+
+        if tradeable.empty:
+            st.error(
+                f"**Nothing clears the bar.** No combination held above "
+                f"{breakeven:.1f}% APR for {hold_days} consecutive days, even "
+                f"once, in the whole history. That is a real answer, not a bug - "
+                f"it means these spreads are noise rather than structure."
+            )
+        else:
+            st.success(
+                f"**{len(tradeable)} combination(s)** held above break-even for "
+                f"{hold_days}+ days at least once. Those are the only rows worth "
+                f"opening in the other tabs."
+            )
+
+        st.dataframe(
+            table.style.background_gradient(subset=["max run (d)"], cmap="Greens"),
+            use_container_width=True, height=520,
+        )
+
+        st.caption(
+            "Read **max run** first. It answers: has this spread EVER survived "
+            "long enough to pay for its own round trip? If the answer is no, "
+            "nothing else in the row matters. A high '% days above' with a low "
+            "'max run' means the spread flickers across the line constantly "
+            "without ever staying there - the worst case, because it looks "
+            "promising on a screener and bleeds fees in practice."
+        )

@@ -28,6 +28,12 @@ class HyperliquidAdapter(VenueAdapter):
 
     QUOTE = "USDC"
 
+    def __init__(self, *a, **kw):
+        # ~1200 weight/min and fundingHistory is expensive. 1.2s between calls
+        # keeps us under it without relying on backoff.
+        kw.setdefault("rate_limit_s", 1.2)
+        super().__init__(*a, **kw)
+
     def list_instruments(self) -> List[str]:
         meta = self._post("/info", {"type": "meta"})
         return [
