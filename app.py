@@ -59,7 +59,7 @@ with st.sidebar:
 
     st.header("Your costs")
     st.caption("Fees in bps, as exchanges quote them. Defaults are placeholders — "
-               "replace with the fund's real tier.")
+               "replace with your own fee tier.")
     round_trip_bps = st.number_input("Round-trip fees (bps)", 0.0, 100.0, 16.0, 1.0)
     slippage_bps = st.number_input("Slippage, both legs (bps)", 0.0, 100.0, 6.0, 1.0)
     hold_days = st.slider("Assumed hold (days)", 1, 60, 14)
