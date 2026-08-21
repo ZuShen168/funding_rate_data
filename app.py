@@ -29,8 +29,15 @@ st.set_page_config(page_title="Funding spread explorer", layout="wide")
 SPOT = "— spot / custom APY —"
 
 
+def _data_fingerprint() -> tuple:
+    """Newest mtime + total size across the parquet files."""
+    from pathlib import Path
+    files = sorted(Path("data/funding").rglob("*.parquet"))
+    return tuple((f.stat().st_mtime, f.stat().st_size) for f in files)
+
+
 @st.cache_data
-def daily_apr() -> pd.DataFrame:
+def _daily_apr(fingerprint: tuple) -> pd.DataFrame:
     """Daily average APR per venue/symbol, as a percentage."""
     df = load()
     df = df[df["rate_apr"].notna() & ~df["is_predicted"]].copy()
@@ -64,7 +71,7 @@ def run_lengths(mask: pd.Series) -> pd.Series:
     return mask.groupby(groups).sum().loc[lambda s: s > 0]
 
 
-data = daily_apr()
+data = _daily_apr(_data_fingerprint())
 if data.empty:
     st.error("No data. Run the backfill first.")
     st.stop()
