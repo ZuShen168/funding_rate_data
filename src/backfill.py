@@ -1,10 +1,16 @@
 """Backfill CLI.
 
-    python -m src.backfill --venues binance bybit hyperliquid \
+    python3 -m src.backfill --venues binance bybit hyperliquid \
         --symbols BTC ETH SOL --days 365
 
-Symbols are given as BASE names; each adapter resolves them to its own
-convention (BTC -> BTCUSDT on Binance, BTC on Hyperliquid).
+    # HIP-3 equity markets on Hyperliquid (pass the prefixed name):
+    python3 -m src.backfill --venues hyperliquid \
+        --symbols xyz:TSLA xyz:NVDA xyz:AAPL --days 365
+
+Symbols are given as BASE names and each adapter resolves them to its own
+convention (BTC -> BTCUSDT on Binance, BTC on Hyperliquid). A symbol containing
+':' is passed through untouched - that's a HIP-3 market and it already carries
+its dex prefix.
 """
 
 from __future__ import annotations
@@ -32,7 +38,6 @@ ADAPTERS: Dict[str, Type[VenueAdapter]] = {
     # "lighter": LighterAdapter,        # see adapters/stubs.py
 }
 
-
 VENUE_QUOTES = {
     "binance": {"USDT", "USDC"},
     "bybit": {"USDT", "USDC"},
@@ -45,13 +50,15 @@ def resolve_symbol(venue: str, base: str, quote: str) -> str:
     if venue == "binance":
         return f"{b}{q}"
     if venue == "bybit":
+        # Bybit's USDC-settled perps use a *PERP suffix, not the quote currency.
         return f"{b}PERP" if q == "USDC" else f"{b}{q}"
     if venue == "hyperliquid":
         return b
     raise KeyError(venue)
 
 
-def run(venues: List[str], bases: List[str], days: int, quotes: List[str]) -> List[FundingObservation]:
+def run(venues: List[str], bases: List[str], days: int,
+        quotes: List[str]) -> List[FundingObservation]:
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=days)
 
@@ -59,21 +66,30 @@ def run(venues: List[str], bases: List[str], days: int, quotes: List[str]) -> Li
     for venue in venues:
         adapter = ADAPTERS[venue]()
         log.info("=== %s ===", venue)
-        log.info("timestamp semantics: %s", adapter.TIMESTAMP_SEMANTICS.split("\n")[0])
+        log.info("timestamp semantics: %s",
+                 adapter.TIMESTAMP_SEMANTICS.split("\n")[0])
         if adapter.VERIFIED.startswith(("UNVERIFIED", "STUB")):
             log.warning("%s adapter is %s", venue, adapter.VERIFIED)
 
         for base in bases:
-            for quote in quotes:
-                if quote.upper() not in VENUE_QUOTES[venue]:
-                    continue
-                sym = resolve_symbol(venue, base, quote)
+            # A ':' means a HIP-3 market - already fully qualified, and it has
+            # exactly one quote (the dex's collateral asset). Don't expand it
+            # across the quote list or we'd fetch the same thing twice.
+            if ":" in base:
+                targets = [base]
+            else:
+                targets = [
+                    resolve_symbol(venue, base, q)
+                    for q in quotes if q.upper() in VENUE_QUOTES[venue]
+                ]
+
+            for sym in targets:
                 try:
                     rows = adapter.fetch_funding_history(sym, start, end)
                 except Exception as e:
-                    log.error("  %-14s FAILED: %s", sym, e)
+                    log.error("  %-16s FAILED: %s", sym, e)
                     continue
-                log.info("  %-14s %5d rows", sym, len(rows))
+                log.info("  %-16s %5d rows", sym, len(rows))
                 all_obs.extend(rows)
 
     log.info("deriving intervals from observed settlement gaps...")
@@ -89,7 +105,7 @@ def run(venues: List[str], bases: List[str], days: int, quotes: List[str]) -> Li
     ):
         flag = "  <-- CHECK" if s["rows_missing_interval"] else ""
         log.info(
-            "  %-12s %-16s %6d rows  %6.1f days  %4d missing interval%s",
+            "  %-20s %-16s %6d rows  %6.1f days  %4d missing interval%s",
             s["venue"], s["canonical_symbol"], s["rows"],
             s["history_days"], s["rows_missing_interval"], flag,
         )
